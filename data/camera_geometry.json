@@ -1,0 +1,24 @@
+{
+  "lane_centerlines": [
+    [[100, 0], [100, 720]],
+    [[300, 0], [300, 720]],
+    [[500, 0], [500, 720]],
+    [[700, 0], [700, 720]]
+  ],
+  "stop_lines": [
+    {
+      "id": "stop_right",
+      "segment": [[0, 450], [200, 450]],
+      "y_threshold": 450
+    }
+  ],
+  "signal_lamps": [
+    {"id": "center", "bbox": [350, 50, 400, 100]},
+    {"id": "right", "bbox": [500, 50, 550, 100]}
+  ],
+  "rois": {
+    "carriageway": [],
+    "crossings": [],
+    "sidewalks": []
+  }
+}
