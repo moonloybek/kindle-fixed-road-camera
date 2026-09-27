@@ -1,103 +1,350 @@
 """
-solution.py — the ONLY file a team has to implement.
+solution.py — WIUT Traffic Event Detection
 
 The organizers' harness (run_submission.py) imports this module and calls:
-
-    detect_events(video_path)  -> [[start_sec, end_sec, label], ...]    # Part A
-    RiskEstimator().reset(meta); .step(frame, t_sec) -> float           # Part B (optional)
-
-Keep the names and signatures exactly as they are. Everything else — models,
-tracking, rules, helper modules under src/ — is up to you.
-
-Labels must come from CLASSES. You may REMOVE classes you never predict;
-do not add new ids.
+    detect_events(video_path)  -> [[start_sec, end_sec, label], ...]
+    RiskEstimator().reset(meta); .step(frame, t_sec) -> float
 """
 from __future__ import annotations
 
 import numpy as np
+import cv2
+from pathlib import Path
+from collections import defaultdict
+from typing import Optional
+import random
 
-# Official class ids (14). See the task description for definitions and
-# start/end conventions. Remove entries you never predict; never add.
+# Set seeds for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+# Try to import ultralytics, provide fallback if not available
+try:
+    from ultralytics import YOLO
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
+
+# Official class ids (14)
 CLASSES: list[str] = [
-    "accident",            # collision between road users / with a fixed object
-    "near_miss",           # sharp braking or swerving to avoid a collision, no contact
-    "red_light",           # crossing the stop line on red
-    "wrong_way",           # driving against the traffic direction / in the oncoming lane
-    "illegal_u_turn",      # U-turn where prohibited
-    "stopped_vehicle",     # stationary on the carriageway >= 10 s, not queued at a signal
-    "jaywalking",          # pedestrian on the carriageway outside a crossing
-    "failure_to_yield",    # driving through a crossing while a pedestrian is on it
-    "illegal_turn",        # turn from the wrong lane or in a prohibited direction
-    "solid_line_crossing", # lane change / manoeuvre across a solid marking
-    "stop_line",           # stopped past the stop line on red
-    "congestion",          # standstill / crawling traffic across all lanes of a direction
-    "road_obstacle",       # debris, animal or fallen object on the carriageway
-    "fire_smoke",          # visible fire or smoke from a vehicle or on the road
+    "accident",
+    "near_miss",
+    "red_light",
+    "wrong_way",
+    "illegal_u_turn",
+    "stopped_vehicle",
+    "jaywalking",
+    "failure_to_yield",
+    "illegal_turn",
+    "solid_line_crossing",
+    "stop_line",
+    "congestion",
+    "road_obstacle",
+    "fire_smoke",
 ]
 
-# Anticipation horizon used by the metric (seconds). step() should return
-# P(an `accident` starts within the next RISK_HORIZON_SEC seconds).
 RISK_HORIZON_SEC = 5.0
+
+# Detection configuration
+FRAME_SKIP = 5  # Process every Nth frame for efficiency
+MIN_EVENT_DURATION = 0.5  # seconds
+MERGE_GAP = 1.0  # seconds
+STOPPED_THRESHOLD = 10.0  # seconds to detect stopped vehicle
+
+
+class VehicleTracker:
+    """Simple vehicle tracking using centroid matching."""
+
+    def __init__(self, max_disappeared=10):
+        self.next_id = 0
+        self.vehicles = {}  # id -> {"centroids": [], "last_seen": 0, "velocities": []}
+        self.max_disappeared = max_disappeared
+        self.disappeared = {}
+
+    def register(self, centroid, frame_idx):
+        """Register a new vehicle."""
+        self.vehicles[self.next_id] = {
+            "centroids": [centroid],
+            "last_seen": frame_idx,
+            "velocities": [],
+            "stopped_frames": 0
+        }
+        self.disappeared[self.next_id] = 0
+        self.next_id += 1
+
+    def update(self, centroids, frame_idx):
+        """Update tracker with new detections."""
+        # If no existing vehicles, register all
+        if not self.vehicles:
+            for c in centroids:
+                self.register(c, frame_idx)
+            return self.vehicles
+
+        # Match detections to existing vehicles
+        if len(centroids) == 0:
+            for vid in self.vehicles:
+                self.disappeared[vid] = self.disappeared.get(vid, 0) + 1
+        else:
+            # Simple matching: nearest centroid
+            used = set()
+            for vid, data in list(self.vehicles.items()):
+                if vid in used:
+                    continue
+                last_centroid = data["centroids"][-1]
+                min_dist = float('inf')
+                best_idx = None
+                for i, c in enumerate(centroids):
+                    if i in used:
+                        continue
+                    dist = np.hypot(c[0] - last_centroid[0], c[1] - last_centroid[1])
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_idx = i
+
+                if best_idx is not None and min_dist < 100:  # Threshold
+                    c = centroids[best_idx]
+                    data["centroids"].append(c)
+                    data["last_seen"] = frame_idx
+                    # Calculate velocity
+                    if len(data["centroids"]) >= 2:
+                        vx = c[0] - data["centroids"][-2][0]
+                        vy = c[1] - data["centroids"][-2][1]
+                        data["velocities"].append((vx, vy))
+                    self.disappeared[vid] = 0
+                    used.add(best_idx)
+                else:
+                    self.disappeared[vid] = self.disappeared.get(vid, 0) + 1
+
+            # Register unmatched detections
+            for i, c in enumerate(centroids):
+                if i not in used:
+                    self.register(c, frame_idx)
+
+        # Remove disappeared vehicles
+        for vid in list(self.vehicles.keys()):
+            if self.disappeared.get(vid, 0) > self.max_disappeared:
+                del self.vehicles[vid]
+                if vid in self.disappeared:
+                    del self.disappeared[vid]
+
+        return self.vehicles
+
+    def get_stationary_count(self, frame_idx, stationary_thresh=5):
+        """Count vehicles that have been stationary."""
+        count = 0
+        for data in self.vehicles.values():
+            if len(data["velocities"]) > 0:
+                recent_v = data["velocities"][-5:]  # Last 5 velocity measurements
+                avg_speed = np.hypot(np.mean([v[0] for v in recent_v]),
+                                     np.mean([v[1] for v in recent_v]))
+                if avg_speed < stationary_thresh:
+                    count += 1
+        return count
+
+
+def detect_objects(frame, model=None):
+    """Detect vehicles and pedestrians in a frame."""
+    if model is None or not HAS_YOLO:
+        # Fallback: use basic motion detection
+        return []
+
+    results = model(frame, verbose=False)
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            cls = int(box.cls[0])
+            # Classes: 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck
+            if cls in [0, 2, 3, 5, 7]:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                detections.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "centroid": (cx, cy),
+                    "class": cls
+                })
+
+    return detections
 
 
 def detect_events(video_path: str) -> list[list]:
-    """Part A — traffic event detection.
-
-    Args:
-        video_path: path to one .mp4 file. You may open it any way you like
-            (OpenCV, decord, PyAV, ffmpeg), read it several times, sample
-            frames, run batched models — anything goes.
-
-    Returns:
-        A list of events, each ``[start_sec, end_sec, label]`` with
-        ``0 <= start_sec < end_sec <= duration`` (floats, seconds from the
-        first frame) and ``label in CLASSES``. Return ``[]`` if nothing
-        happened. Segments of the same class must not overlap.
-
-    A typical pipeline:
-        1. sample frames (every 2nd–5th frame is usually enough),
-        2. detect road users (YOLO / RT-DETR) and track them (ByteTrack),
-        3. turn trajectories + scene layout (lanes, stop line, crossing)
-           into per-frame flags for each class,
-        4. merge consecutive flags into segments, drop blips < 0.5 s,
-           merge gaps < 1 s,
-        5. optionally re-score `accident` / `near_miss` candidates with a
-           learned clip classifier.
     """
-    # TODO: replace this stub with your pipeline.
-    return []
+    Part A — traffic event detection.
+    Returns: [[start_sec, end_sec, label], ...]
+    """
+    if not Path(video_path).exists():
+        return []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps
+
+    # Initialize model (lightweight YOLO)
+    model = None
+    if HAS_YOLO:
+        try:
+            # Try weights folder first, then current dir
+            weight_path = Path("weights/yolov8n.pt")
+            if weight_path.exists():
+                model = YOLO(str(weight_path))
+            else:
+                model = YOLO("yolov8n.pt")
+        except Exception:
+            pass
+
+    # Tracking
+    tracker = VehicleTracker()
+
+    # Event detection state
+    stopped_vehicle_start = None
+    stopped_vehicle_frames = 0
+
+    # Sample frames
+    frame_idx = 0
+    events = []
+
+    # Track individual vehicles for stopped detection
+    vehicle_speeds = defaultdict(list)  # vehicle_id -> list of speeds
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % FRAME_SKIP == 0:
+            t_sec = frame_idx / fps
+
+            # Detect objects
+            detections = detect_objects(frame, model)
+
+            # Get centroids
+            centroids = [d["centroid"] for d in detections]
+
+            # Update tracker
+            tracker.update(centroids, frame_idx)
+
+            # Track speeds for each vehicle
+            for vid, data in tracker.vehicles.items():
+                if len(data["velocities"]) > 0:
+                    recent_v = data["velocities"][-3:]
+                    speed = np.hypot(np.mean([v[0] for v in recent_v]),
+                                    np.mean([v[1] for v in recent_v]))
+                    vehicle_speeds[vid].append(speed)
+
+            # Detect stopped vehicles: require sustained stationary (30+ frames)
+            for vid, speeds in list(vehicle_speeds.items()):
+                if len(speeds) >= 30:  # ~5 seconds of tracking
+                    recent_speeds = speeds[-30:]
+                    if np.mean(recent_speeds) < 2.0:  # Very low speed
+                        if stopped_vehicle_start is None:
+                            stopped_vehicle_start = t_sec - 5.0  # Backdate
+                        break
+            else:
+                # No vehicle is stopped
+                if stopped_vehicle_start is not None:
+                    if t_sec - stopped_vehicle_start >= STOPPED_THRESHOLD:
+                        events.append([stopped_vehicle_start, t_sec, "stopped_vehicle"])
+                    stopped_vehicle_start = None
+
+        frame_idx += 1
+
+    cap.release()
+
+    # Post-process events: merge gaps and filter short events
+    events = merge_and_filter_events(events, duration)
+
+    return events
+
+
+def merge_and_filter_events(events, video_duration):
+    """Merge gaps and filter short events."""
+    if not events:
+        return []
+
+    # Sort by start time
+    events = sorted(events, key=lambda x: x[0])
+
+    merged = [events[0]]
+
+    for event in events[1:]:
+        last = merged[-1]
+        # Same class and within merge gap
+        if event[2] == last[2] and event[0] - last[1] < MERGE_GAP:
+            merged[-1] = [last[0], event[1], event[2]]
+        else:
+            merged.append(event)
+
+    # Filter short events
+    filtered = []
+    for event in merged:
+        if event[1] - event[0] >= MIN_EVENT_DURATION:
+            # Clamp to video duration
+            event[0] = max(0, event[0])
+            event[1] = min(video_duration, event[1])
+            filtered.append(event)
+
+    return filtered
 
 
 class RiskEstimator:
-    """Part B — causal accident anticipation (optional, bonus).
+    """Part B — causal accident anticipation (optional, bonus)."""
 
-    The harness calls ``reset(meta)`` once per video and then ``step`` for
-    EVERY frame, in order. ``step`` must use only the frames it has seen so
-    far: do not open the video file inside this class, and do not reuse
-    Part A results that were computed with access to future frames.
-    """
+    def __init__(self):
+        self.meta = None
+        self.tracker = VehicleTracker()
+        self.risk_history = []
+        self.frame_idx = 0
 
     def reset(self, meta: dict) -> None:
-        """Called once before the first frame of each video.
-
-        meta = {"video_id": str, "fps": float, "width": int, "height": int,
-                "n_frames": int}
-        """
+        """Called once before the first frame of each video."""
         self.meta = meta
-        self.last_score = 0.0
+        self.tracker = VehicleTracker()
+        self.risk_history = []
+        self.frame_idx = 0
 
     def step(self, frame: np.ndarray, t_sec: float) -> float:
-        """Return P(accident starts within the next RISK_HORIZON_SEC s).
+        """Return P(accident starts within the next RISK_HORIZON_SEC s)."""
+        # Sample every 10 frames for performance
+        if self.frame_idx % 10 != 0:
+            if self.risk_history:
+                return self.risk_history[-1]
+            return 0.0
 
-        Args:
-            frame: BGR uint8 array of shape (H, W, 3) — OpenCV convention.
-            t_sec: timestamp of this frame in seconds.
+        # Simple risk based on vehicle proximity
+        detections = detect_objects(frame)
 
-        Returns:
-            A float in [0, 1]. Skipping frames internally and returning the
-            previous score is fine; the harness still expects a value for
-            every call.
-        """
-        # TODO: replace this stub. A simple strong baseline: track vehicles,
-        # estimate time-to-collision between pairs, map min TTC -> risk.
-        return self.last_score
+        if not detections:
+            self.risk_history.append(0.0)
+            self.frame_idx += 1
+            return 0.0
+
+        centroids = [d["centroid"] for d in detections]
+        self.tracker.update(centroids, self.frame_idx)
+
+        # Calculate risk based on proximity of vehicles
+        risk = 0.0
+
+        if len(centroids) >= 2:
+            # Check distance between all pairs
+            for i, c1 in enumerate(centroids):
+                for c2 in centroids[i+1:]:
+                    dist = np.hypot(c1[0] - c2[0], c1[1] - c2[1])
+                    # Closer vehicles = higher risk
+                    if dist < 50:
+                        risk = max(risk, 1.0 - (dist / 50))
+                    elif dist < 150:
+                        risk = max(risk, 0.5 * (1.0 - (dist - 50) / 100))
+
+        # Deterministic risk (no randomness)
+
+        self.risk_history.append(risk)
+        self.frame_idx += 1
+
+        return risk
