@@ -315,6 +315,9 @@ def show_live_demo():
             </div>
             """, unsafe_allow_html=True)
 
+            # Get risk data first
+            risk_data = result.get("risk", [])
+
             # Statistics
             if "stats" in result:
                 stats = result["stats"]
@@ -357,7 +360,6 @@ def show_live_demo():
 
             # Risk visualization
             st.markdown("### 📈 Risk Timeline")
-            risk_data = result.get("risk", [])
             if risk_data:
                 # Simple risk display
                 risk_times = [r[0] for r in risk_data]
