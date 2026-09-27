@@ -1,0 +1,19 @@
+{
+  "settings_version": "0.0.8",
+  "datasets_dir": "C:\\Users\\user\\Downloads\\wiut_cv_scripts\\wiut_cv_scripts\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "5aba7f8eb4ceb4778b2d8622a9784b78200378d50878cc264d8405b5d918557f",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "mlflow": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}
