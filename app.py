@@ -161,12 +161,39 @@ def process_video_with_solution(video_path: str) -> dict:
     """
     Process video using the actual solution.py detect_events function
     and RiskEstimator for risk scoring.
+    Returns: dict with events, risk, stats, annotated_frames
     """
     info = get_video_info(video_path)
     if not info:
         return {"error": "Could not open video file"}
 
     video_id = Path(video_path).name
+    total_frames = info["frame_count"]
+    fps = info["fps"]
+
+    # Initialize tracking stats
+    stats = {
+        "total_vehicles": 0,
+        "total_pedestrians": 0,
+        "max_concurrent": 0
+    }
+
+    # Sample frames for annotated output (every 30 seconds, max 3 frames)
+    sample_times = list(range(0, int(info["duration"]), 30))[:3]
+    annotated_frames = []
+
+    # Check if YOLO is available
+    model = None
+    if solution.HAS_YOLO:
+        try:
+            from ultralytics import YOLO
+            weight_path = Path("weights/yolov8n.pt")
+            if weight_path.exists():
+                model = YOLO(str(weight_path))
+            else:
+                model = YOLO("yolov8n.pt")
+        except Exception:
+            pass
 
     # Call solution.detect_events()
     try:
@@ -174,14 +201,14 @@ def process_video_with_solution(video_path: str) -> dict:
     except Exception as e:
         return {"error": f"Detection failed: {str(e)}"}
 
-    # Run RiskEstimator for risk curve
+    # Run RiskEstimator for risk curve + collect stats
     risk_estimator = solution.RiskEstimator()
     risk_estimator.reset({
         "video_id": video_id,
-        "fps": info["fps"],
+        "fps": fps,
         "width": info["width"],
         "height": info["height"],
-        "n_frames": info["frame_count"]
+        "n_frames": total_frames
     })
 
     # Process frames for risk estimation
@@ -194,23 +221,45 @@ def process_video_with_solution(video_path: str) -> dict:
         if not ret:
             break
 
-        t_sec = frame_idx / info["fps"]
+        t_sec = frame_idx / fps
         risk_score = risk_estimator.step(frame, t_sec)
         risk_data.append([t_sec, risk_score])
+
+        # Count detections at this frame
+        if model and frame_idx % 10 == 0:
+            try:
+                results = model(frame, verbose=False)
+                for r in results:
+                    boxes = r.boxes
+                    current_count = len(boxes)
+                    stats["max_concurrent"] = max(stats["max_concurrent"], current_count)
+
+                # Capture annotated frame at sample times
+                if int(t_sec) in sample_times and len(annotated_frames) < 3:
+                    annotated = frame.copy()
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        cls = int(box.cls[0])
+                        color = (0, 255, 0) if cls in [2, 3, 5, 7] else (255, 0, 0)
+                        cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                    annotated_frames.append({"time": t_sec, "frame": annotated, "count": current_count})
+            except Exception:
+                pass
+
         frame_idx += 1
 
-        # Sample every 10th frame for performance
-        if frame_idx % 10 == 0:
-            # Keep processing but don't store every frame
-            pass
-
     cap.release()
+
+    # Final stats
+    stats["total_frames_processed"] = frame_idx
 
     return {
         "video_id": video_id,
         "info": info,
         "events": events,
-        "risk": risk_data
+        "risk": risk_data,
+        "stats": stats,
+        "annotated_frames": annotated_frames
     }
 
 
@@ -265,6 +314,33 @@ def show_live_demo():
                 <strong>Resolution:</strong> {info['width']}x{info['height']}</p>
             </div>
             """, unsafe_allow_html=True)
+
+            # Statistics
+            if "stats" in result:
+                stats = result["stats"]
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Frames Processed", stats.get("total_frames_processed", 0))
+                with col2:
+                    st.metric("Max Vehicles in Frame", stats.get("max_concurrent", 0))
+                with col3:
+                    st.metric("Detected Events", len(result.get("events", [])))
+                with col4:
+                    avg_risk = np.mean([r[1] for r in risk_data]) if risk_data else 0
+                    st.metric("Avg Risk Score", f"{avg_risk:.3f}")
+
+            # Annotated frames
+            if "annotated_frames" in result and result["annotated_frames"]:
+                st.markdown("### 🎬 Detected Objects (Sample Frames)")
+                for i, af in enumerate(result["annotated_frames"]):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        # Convert BGR to RGB for display
+                        frame_rgb = cv2.cvtColor(af["frame"], cv2.COLOR_BGR2RGB)
+                        st.image(frame_rgb, caption=f"Time: {af['time']:.1f}s - {af['count']} objects", use_container_width=True)
+                    with col2:
+                        st.markdown(f"**Time:** {af['time']:.1f}s")
+                        st.markdown(f"**Objects:** {af['count']}")
 
             # Events found
             if result["events"]:
